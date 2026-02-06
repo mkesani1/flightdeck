@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Clock, Check, AlertCircle, Zap, FileText, Target, CreditCard } from 'lucide-react';
 import Navigation from '../components/Navigation';
 import { mockActiveAgents, mockInterventions, mockActivityFeed, mockLiveStats, generateRandomActivity } from '../lib/mockData';
+import { useTasks, useInterventions, useActivityFeed, useLiveStats, useAgents } from '../lib/realtime';
 import type { ActivityFeedItem, Intervention, ActiveAgent, LiveStats } from '../types';
 
 // Utility to format time ago
@@ -251,25 +252,108 @@ function InterventionCard({ intervention, onResolve }: { intervention: Intervent
 
 // Main LiveOps Page
 export default function LiveOps() {
-  const [activityFeed, setActivityFeed] = useState<ActivityFeedItem[]>(mockActivityFeed.slice(0, 5));
-  const [interventions, setInterventions] = useState<Intervention[]>(mockInterventions);
-  const [stats] = useState<LiveStats>(mockLiveStats);
+  // Real-time hooks
+  const { tasks, loading: tasksLoading } = useTasks();
+  const { interventions: realtimeInterventions, resolveIntervention, loading: interventionsLoading } = useInterventions();
+  const { activities: realtimeActivities, loading: activitiesLoading } = useActivityFeed(5);
+  const { stats: realtimeStats, loading: statsLoading } = useLiveStats();
+  const { agents } = useAgents();
 
-  // Simulate live activity updates
+  // Fallback to mock data if database is empty
+  const [mockFeed, setMockFeed] = useState<ActivityFeedItem[]>(mockActivityFeed.slice(0, 5));
+
+  // Use real data if available, otherwise fall back to mock
+  const activityFeed = realtimeActivities.length > 0 ? realtimeActivities.map(a => ({
+    id: a.id,
+    type: a.type,
+    message: a.message,
+    created_at: a.created_at,
+    agent: a.agent ? { id: a.agent.id, name: a.agent.name, emoji: a.agent.emoji || '🤖', type: a.agent.type as any } : undefined,
+    business: a.business ? { id: a.business.id, name: a.business.name, color: a.business.color, avatar_initials: a.business.avatar_initials || '' } : undefined,
+  })) as ActivityFeedItem[] : mockFeed;
+
+  const interventions = realtimeInterventions.length > 0 ? realtimeInterventions.map(i => ({
+    id: i.id,
+    type: i.type,
+    title: i.title,
+    context: i.context,
+    options: i.options,
+    status: i.status,
+    created_at: i.created_at,
+    resolved_at: i.resolved_at,
+    agent: i.agent ? { id: i.agent.id, name: i.agent.name, emoji: i.agent.emoji || '🤖', type: i.agent.type as any } : undefined,
+    business: i.business ? { id: i.business.id, name: i.business.name, color: i.business.color, avatar_initials: i.business.avatar_initials || '' } : undefined,
+  })) as Intervention[] : mockInterventions;
+
+  const stats = !statsLoading && (realtimeStats.tasksToday > 0 || realtimeStats.needsYou > 0) ? realtimeStats : mockLiveStats;
+
+  // Derive active agents from tasks
+  const activeAgents = useMemo(() => {
+    if (tasks.length === 0) return mockActiveAgents;
+
+    const inProgressTasks = tasks.filter(t => t.status === 'in_progress');
+    const activeAgentMap = new Map<string, ActiveAgent>();
+
+    for (const task of inProgressTasks) {
+      if (task.agent) {
+        activeAgentMap.set(task.agent.id, {
+          agent: {
+            id: task.agent.id,
+            name: task.agent.name,
+            emoji: task.agent.emoji || '🤖',
+            type: task.agent.type as any,
+          },
+          currentTask: task.title,
+          isActive: true,
+          business: task.business ? {
+            id: task.business.id,
+            name: task.business.name,
+            color: task.business.color,
+            avatar_initials: task.business.avatar_initials || '',
+          } : undefined,
+        });
+      }
+    }
+
+    // Add idle agents
+    for (const agent of agents) {
+      if (!activeAgentMap.has(agent.id)) {
+        activeAgentMap.set(agent.id, {
+          agent: {
+            id: agent.id,
+            name: agent.name,
+            emoji: agent.emoji || '🤖',
+            type: agent.type as any,
+          },
+          currentTask: 'Idle',
+          isActive: false,
+        });
+      }
+    }
+
+    return Array.from(activeAgentMap.values()).slice(0, 6);
+  }, [tasks, agents]);
+
+  // Simulate live activity updates only when using mock data
   useEffect(() => {
-    const interval = setInterval(() => {
-      const newActivity = generateRandomActivity();
-      setActivityFeed(prev => [newActivity, ...prev.slice(0, 4)]);
-    }, 8000);
+    if (realtimeActivities.length === 0) {
+      const interval = setInterval(() => {
+        const newActivity = generateRandomActivity();
+        setMockFeed(prev => [newActivity, ...prev.slice(0, 4)]);
+      }, 8000);
+      return () => clearInterval(interval);
+    }
+  }, [realtimeActivities.length]);
 
-    return () => clearInterval(interval);
-  }, []);
-
-  const handleResolveIntervention = (id: string) => {
-    setInterventions(prev => prev.filter(i => i.id !== id));
+  const handleResolveIntervention = async (id: string) => {
+    try {
+      await resolveIntervention(id, 'resolved');
+    } catch (err) {
+      console.error('Failed to resolve intervention:', err);
+    }
   };
 
-  const activeAgentCount = mockActiveAgents.filter(a => a.isActive).length;
+  const activeAgentCount = activeAgents.filter(a => a.isActive).length;
 
   return (
     <div className="min-h-screen bg-[var(--color-dark-bg)] text-white">
@@ -282,7 +366,7 @@ export default function LiveOps() {
           <div style={{ marginBottom: '40px' }}>
             <h1 className="text-2xl font-bold mb-2 text-white">Live Operations</h1>
             <p className="text-[14px] text-[#636366]">
-              Watching {activeAgentCount} agents work across {new Set(mockActiveAgents.map(a => a.business?.id)).size} businesses
+              Watching {activeAgentCount} agents work across {new Set(activeAgents.filter(a => a.business).map(a => a.business?.id)).size} businesses
             </p>
           </div>
 
@@ -295,7 +379,7 @@ export default function LiveOps() {
               Active Agents
             </h2>
             <div className="grid grid-cols-3" style={{ gap: '20px' }}>
-              {mockActiveAgents.map((activeAgent, index) => (
+              {activeAgents.map((activeAgent, index) => (
                 <AgentCard key={activeAgent.agent.id} activeAgent={activeAgent} index={index} />
               ))}
             </div>
